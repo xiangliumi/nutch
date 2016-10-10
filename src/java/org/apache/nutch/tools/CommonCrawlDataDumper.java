@@ -23,7 +23,6 @@ import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileFilter;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.MalformedURLException;
@@ -33,7 +32,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -54,15 +57,20 @@ import org.apache.commons.io.FilenameUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.io.SequenceFile;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
+import org.apache.nutch.crawl.Inlink;
+import org.apache.nutch.crawl.Inlinks;
+import org.apache.nutch.crawl.LinkDbReader;
 import org.apache.nutch.metadata.Metadata;
 import org.apache.nutch.protocol.Content;
-import org.apache.nutch.segment.SegmentReader;
 import org.apache.nutch.util.DumpFileUtil;
 import org.apache.nutch.util.NutchConfiguration;
 //Tika imports
@@ -174,7 +182,8 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
 
   private static final Logger LOG = LoggerFactory
       .getLogger(CommonCrawlDataDumper.class.getName());
-
+  private static final int MAX_INLINKS = 5000;
+  
   private CommonCrawlConfig config = null;
 
   // Gzip initialization
@@ -194,7 +203,6 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
    *             the gzip option may be provided.
    * @throws Exception
    */
-  @SuppressWarnings("static-access")
   public static void main(String[] args) throws Exception {
     Configuration conf = NutchConfiguration.create();
     int res = ToolRunner.run(conf, new CommonCrawlDataDumper(), args);
@@ -220,13 +228,14 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
    * @param outputDir      the directory you wish to dump the raw content to. This
    *                       directory will be created.
    * @param segmentRootDir a directory containing one or more segments.
+   * @param linkdb         Path to linkdb.
    * @param gzip           a boolean flag indicating whether the CBOR content should also
    *                       be gzipped.
    * @param epochFilename  if {@code true}, output files will be names using the epoch time (in milliseconds).
    * @param extension      a file extension to use with output documents.
    * @throws Exception if any exception occurs.
    */
-  public void dump(File outputDir, File segmentRootDir, boolean gzip,
+  public void dump(File outputDir, File segmentRootDir, File linkdb, boolean gzip,
       String[] mimeTypes, boolean epochFilename, String extension, boolean warc)
       throws Exception {
     if (gzip) {
@@ -238,66 +247,48 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
     Map<String, Integer> filteredCounts = new HashMap<String, Integer>();
 
     Configuration nutchConfig = NutchConfiguration.create();
-    FileSystem fs = FileSystem.get(nutchConfig);
-    File[] segmentDirs = segmentRootDir.listFiles(new FileFilter() {
-      @Override
-      public boolean accept(File file) {
-        return file.canRead() && file.isDirectory();
-      }
-    });
+    final FileSystem fs = FileSystem.get(nutchConfig);
+    Path segmentRootPath = new Path(segmentRootDir.toString());
 
-    if (new File(
-        segmentRootDir.getAbsolutePath() + File.separator + Content.DIR_NAME
-            + "/part-00000/data").exists()) {
-      segmentDirs = new File[] { segmentRootDir };
+    //get all paths
+    List<Path> parts = new ArrayList<>();
+    RemoteIterator<LocatedFileStatus> files = fs.listFiles(segmentRootPath, true);
+    String partPattern = ".*" + File.separator + Content.DIR_NAME
+        + File.separator + "part-[0-9]{5}" + File.separator + "data";
+    while (files.hasNext()) {
+      LocatedFileStatus next = files.next();
+      if (next.isFile()) {
+        Path path = next.getPath();
+        if (path.toString().matches(partPattern)){
+          parts.add(path);
+        }
+      }
     }
 
-    if (segmentDirs == null) {
-      LOG.error(
-          "No segment directories found in [" + segmentRootDir.getAbsolutePath()
-              + "]");
+    LinkDbReader linkDbReader = null;
+    if (linkdb != null) {
+      linkDbReader = new LinkDbReader(fs.getConf(), new Path(linkdb.toString()));
+    }
+    if (parts == null || parts.size() == 0) {
+      LOG.error( "No segment directories found in {} ",
+          segmentRootDir.getAbsolutePath());
       System.exit(1);
     }
-
+    LOG.info("Found {} segment parts", parts.size());
     if (gzip && !warc) {
-      fileList = new ArrayList<String>();
+      fileList = new ArrayList<>();
       constructNewStream(outputDir);
     }
 
-    CommonCrawlFormat format = CommonCrawlFormatFactory
-        .getCommonCrawlFormat("JACKSON", nutchConfig, config);
-
-    if (warc) {
-      format = CommonCrawlFormatFactory
-          .getCommonCrawlFormat("WARC", nutchConfig, config);
-    }
-
-    for (File segment : segmentDirs) {
-      LOG.info("Processing segment: [" + segment.getAbsolutePath() + "]");
+    for (Path segmentPart : parts) {
+      LOG.info("Processing segment Part : [ {} ]", segmentPart);
       try {
-        String segmentContentPath =
-            segment.getAbsolutePath() + File.separator + Content.DIR_NAME
-                + "/part-00000/data";
-        Path file = new Path(segmentContentPath);
-
-        if (!new File(file.toString()).exists()) {
-          LOG.warn("Skipping segment: [" + segmentContentPath
-              + "]: no data directory present");
-          continue;
-        }
         SequenceFile.Reader reader = new SequenceFile.Reader(nutchConfig,
-            SequenceFile.Reader.file(file));
-
-        if (!new File(file.toString()).exists()) {
-          LOG.warn("Skipping segment: [" + segmentContentPath
-              + "]: no data directory present");
-          continue;
-        }
+            SequenceFile.Reader.file(segmentPart));
 
         Writable key = (Writable) reader.getKeyClass().newInstance();
 
         Content content = null;
-
         while (reader.next(key)) {
           content = new Content();
           reader.getCurrentValue(content);
@@ -330,7 +321,7 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
 
             reverseKey = reverseUrl(url);
             config.setReverseKeyValue(
-                reverseKey.replace("/", "_") + "_" + DigestUtils.shaHex(url)
+                reverseKey.replace("/", "_") + "_" + DigestUtils.sha1Hex(url)
                     + "_" + timestamp);
           }
 
@@ -368,7 +359,25 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
             String mimeType = new Tika().detect(content.getContent());
             // Maps file to JSON-based structure
 
-            jsonData = format.getJsonData(url, content, metadata);
+            Set<String> inUrls = null; //there may be duplicates, so using set
+            if (linkDbReader != null) {
+              Inlinks inlinks = linkDbReader.getInlinks((Text) key);
+              if (inlinks != null) {
+                Iterator<Inlink> iterator = inlinks.iterator();
+                inUrls = new LinkedHashSet<>();
+                while (inUrls.size() <= MAX_INLINKS && iterator.hasNext()){
+                  inUrls.add(iterator.next().getFromUrl());
+                }
+              }
+            }
+            //TODO: Make this Jackson Format implementation reusable
+            try (CommonCrawlFormat format = CommonCrawlFormatFactory
+                .getCommonCrawlFormat(warc ? "WARC" : "JACKSON", nutchConfig, config)) {
+              if (inUrls != null) {
+                format.setInLinks(new ArrayList<>(inUrls));
+              }
+              jsonData = format.getJsonData(url, content, metadata);
+            }
 
             collectStats(typeCounts, mimeType);
             // collects statistics for the given mimetypes
@@ -415,15 +424,13 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
             }
           }
         }
-
         reader.close();
+      } catch (Exception e){
+        LOG.warn("SKIPPED: {} Because : {}", segmentPart, e.getMessage());
       } finally {
         fs.close();
       }
     }
-
-    // close the format if needed
-    format.close();
 
     if (gzip && !warc) {
       closeStream();
@@ -565,6 +572,7 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
   public int run(String[] args) throws Exception {
     Option helpOpt = new Option("h", "help", false, "show this help message.");
     // argument options
+    @SuppressWarnings("static-access")
     Option outputOpt = OptionBuilder.withArgName("outputDir").hasArg()
         .withDescription(
             "output directory (which will be created) to host the CBOR data.")
@@ -572,41 +580,56 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
     // WARC format
     Option warcOpt = new Option("warc", "export to a WARC file");
 
+    @SuppressWarnings("static-access")
     Option segOpt = OptionBuilder.withArgName("segment").hasArgs()
         .withDescription("the segment or directory containing segments to use").create("segment");
     // create mimetype and gzip options
+    @SuppressWarnings("static-access")
     Option mimeOpt = OptionBuilder.isRequired(false).withArgName("mimetype")
         .hasArgs().withDescription(
             "an optional list of mimetypes to dump, excluding all others. Defaults to all.")
         .create("mimetype");
+    @SuppressWarnings("static-access")
     Option gzipOpt = OptionBuilder.withArgName("gzip").hasArg(false)
         .withDescription(
             "an optional flag indicating whether to additionally gzip the data.")
         .create("gzip");
+    @SuppressWarnings("static-access")
     Option keyPrefixOpt = OptionBuilder.withArgName("keyPrefix").hasArg(true)
         .withDescription("an optional prefix for key in the output format.")
         .create("keyPrefix");
+    @SuppressWarnings("static-access")
     Option simpleDateFormatOpt = OptionBuilder.withArgName("SimpleDateFormat")
         .hasArg(false).withDescription(
             "an optional format for timestamp in GMT epoch milliseconds.")
         .create("SimpleDateFormat");
+    @SuppressWarnings("static-access")
     Option epochFilenameOpt = OptionBuilder.withArgName("epochFilename")
         .hasArg(false)
         .withDescription("an optional format for output filename.")
         .create("epochFilename");
+    @SuppressWarnings("static-access")
     Option jsonArrayOpt = OptionBuilder.withArgName("jsonArray").hasArg(false)
         .withDescription("an optional format for JSON output.")
         .create("jsonArray");
+    @SuppressWarnings("static-access")
     Option reverseKeyOpt = OptionBuilder.withArgName("reverseKey").hasArg(false)
         .withDescription("an optional format for key value in JSON output.")
         .create("reverseKey");
+    @SuppressWarnings("static-access")
     Option extensionOpt = OptionBuilder.withArgName("extension").hasArg(true)
         .withDescription("an optional file extension for output documents.")
         .create("extension");
+    @SuppressWarnings("static-access")
     Option sizeOpt = OptionBuilder.withArgName("warcSize").hasArg(true)
         .withType(Number.class)
         .withDescription("an optional file size in bytes for the WARC file(s)")
         .create("warcSize");
+    @SuppressWarnings("static-access")
+    Option linkDbOpt = OptionBuilder.withArgName("linkdb").hasArg(true)
+        .withDescription("an optional linkdb parameter to include inlinks in dump files")
+        .isRequired(false)
+        .create("linkdb");
 
     // create the options
     Options options = new Options();
@@ -626,6 +649,7 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
     options.addOption(reverseKeyOpt);
     options.addOption(extensionOpt);
     options.addOption(sizeOpt);
+    options.addOption(linkDbOpt);
 
     CommandLineParser parser = new GnuParser();
     try {
@@ -655,6 +679,8 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
       if (line.getParsedOptionValue("warcSize") != null) {
         warcSize = (Long) line.getParsedOptionValue("warcSize");
       }
+      String linkdbPath = line.getOptionValue("linkdb");
+      File linkdb = linkdbPath == null ? null : new File(linkdbPath);
 
       CommonCrawlConfig config = new CommonCrawlConfig();
       config.setKeyPrefix(keyPrefix);
@@ -675,7 +701,7 @@ public class CommonCrawlDataDumper extends Configured implements Tool {
 
       CommonCrawlDataDumper dumper = new CommonCrawlDataDumper(config);
 
-      dumper.dump(outputDir, segmentRootDir, gzip, mimeTypes, epochFilename,
+      dumper.dump(outputDir, segmentRootDir, linkdb, gzip, mimeTypes, epochFilename,
           extension, warc);
 
     } catch (Exception e) {

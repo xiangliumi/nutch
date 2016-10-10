@@ -103,14 +103,14 @@ public class IndexingJob extends NutchTool implements Tool {
 
     SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
     long start = System.currentTimeMillis();
-    LOG.info("Indexer: starting at " + sdf.format(start));
+    LOG.info("Indexer: starting at {}", sdf.format(start));
 
     final JobConf job = new NutchJob(getConf());
     job.setJobName("Indexer");
 
-    LOG.info("Indexer: deleting gone documents: " + deleteGone);
-    LOG.info("Indexer: URL filtering: " + filter);
-    LOG.info("Indexer: URL normalizing: " + normalize);
+    LOG.info("Indexer: deleting gone documents: {}", deleteGone);
+    LOG.info("Indexer: URL filtering: {}", filter);
+    LOG.info("Indexer: URL normalizing: {}", normalize);
     if (addBinaryContent) {
       if (base64) {
         LOG.info("Indexer: adding binary content as Base64");
@@ -186,11 +186,13 @@ public class IndexingJob extends NutchTool implements Tool {
     boolean base64 = false;
 
     for (int i = 1; i < args.length; i++) {
+      FileSystem fs = null;
+      Path dir = null;
       if (args[i].equals("-linkdb")) {
         linkDb = new Path(args[++i]);
       } else if (args[i].equals("-dir")) {
-        Path dir = new Path(args[++i]);
-        FileSystem fs = dir.getFileSystem(getConf());
+        dir = new Path(args[++i]);
+        fs = dir.getFileSystem(getConf());
         FileStatus[] fstats = fs.listStatus(dir,
             HadoopFSUtil.getPassDirectoriesFilter(fs));
         Path[] files = HadoopFSUtil.getPaths(fstats);
@@ -214,7 +216,11 @@ public class IndexingJob extends NutchTool implements Tool {
       } else if (args[i].equals("-params")) {
         params = args[++i];
       } else {
-        segments.add(new Path(args[i]));
+        dir = new Path(args[i]);
+        fs = dir.getFileSystem(getConf());
+        if (SegmentChecker.isIndexable(dir,fs)) {
+          segments.add(dir);
+        }
       }
     }
 
@@ -222,7 +228,7 @@ public class IndexingJob extends NutchTool implements Tool {
       index(crawlDb, linkDb, segments, noCommit, deleteGone, params, filter, normalize, addBinaryContent, base64);
       return 0;
     } catch (final Exception e) {
-      LOG.error("Indexer: " + StringUtils.stringifyException(e));
+      LOG.error("Indexer: {}", StringUtils.stringifyException(e));
       return -1;
     }
   }
